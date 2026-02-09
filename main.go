@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -162,6 +165,45 @@ type Preferences struct {
 }
 
 // ==========================================
+// WARP Structs
+// ==========================================
+
+const CFWarpRegURL = "https://api.cloudflareclient.com/v0a2025/reg"
+
+type cfRegisterRequest struct {
+	TOS string `json:"tos"`
+	Key string `json:"key"`
+}
+
+type cfRegisterResponse struct {
+	ID      string `json:"id"`
+	Token   string `json:"token"`
+	Account struct {
+		License string `json:"license"`
+	} `json:"account"`
+	Config struct {
+		ClientID string `json:"client_id"`
+		Peers    []struct {
+			PublicKey string `json:"public_key"`
+		} `json:"peers"`
+		Interface struct {
+			Addresses struct {
+				V4 string `json:"v4"`
+				V6 string `json:"v6"`
+			} `json:"addresses"`
+		} `json:"interface"`
+	} `json:"config"`
+}
+
+type WarpResponse struct {
+	ClientID string
+	V4       string
+	V6       string
+	PubKey   string // Server Public Key
+	PrivKey  string // Client Private Key
+}
+
+// ==========================================
 // Globals
 // ==========================================
 
@@ -278,6 +320,21 @@ func createInstance(r *bufio.Reader) {
 		enableMetacube = prompt(r, "  Download Metacube Dashboard? [y/N]: ", "N") == "y"
 	}
 
+	// --- FEATURE: WARP Outbound ---
+	enableWarp := prompt(r, "Use WARP (Cloudflare WireGuard) as outbound? [y/N]: ", "N") == "y"
+	var warpConfig WarpResponse
+	if enableWarp {
+		fmt.Println(Colors["Yellow"] + "Fetching WARP config..." + Colors["Reset"])
+		var warpErr error
+		warpConfig, warpErr = fetchWarpConfig()
+		if warpErr != nil {
+			fmt.Printf(Colors["Red"]+"WARP setup failed: %v\nFalling back to direct."+Colors["Reset"]+"\n", warpErr)
+			enableWarp = false
+		} else {
+			fmt.Println(Colors["Green"] + "WARP registered successfully!" + Colors["Reset"])
+		}
+	}
+
 	// Certs
 	fmt.Println(Colors["Yellow"] + "Generating Certificates..." + Colors["Reset"])
 	certPath := filepath.Join(instanceDir, "server.crt")
@@ -285,19 +342,27 @@ func createInstance(r *bufio.Reader) {
 	generateSelfSignedCert(sni, certPath, keyPath)
 
 	// 1. Server Config
-	serverConfig := Config{
-		Log: LogConfig{Level: "info", Output: filepath.Join(instanceDir, "access.log"), Timestamp: true},
-		Inbounds: []Inbound{{
+	// Build server outbounds
+	var serverOutbounds []interface{}
+	if enableWarp {
+		wgOutbound := buildWireGuardOutbound(warpConfig)
+		serverOutbounds = append(serverOutbounds, wgOutbound)
+	}
+	serverOutbounds = append(serverOutbounds, map[string]string{"type": "direct", "tag": "direct"})
+
+	serverConfigMap := map[string]interface{}{
+		"log": LogConfig{Level: "info", Output: filepath.Join(instanceDir, "access.log"), Timestamp: true},
+		"inbounds": []Inbound{{
 			Type: "hysteria2", Tag: "hy2-" + id, Listen: "::", ListenPort: port,
 			UpMbps: up, DownMbps: down,
-			Users: []User{{Name: "user", Password: password}},
-			TLS:   &TLSConfig{Enabled: true, CertificatePath: certPath, KeyPath: keyPath},
-			Obfs:  &ObfsConfig{Type: "salamander", Password: obfsPass},
+			Users:      []User{{Name: "user", Password: password}},
+			TLS:        &TLSConfig{Enabled: true, CertificatePath: certPath, KeyPath: keyPath},
+			Obfs:       &ObfsConfig{Type: "salamander", Password: obfsPass},
 			Masquerade: &MasqConfig{Type: "proxy", URL: "https://" + sni + "/", RewriteHost: true},
 		}},
-		Outbounds: []Outbound{{Type: "direct", Tag: "direct"}},
+		"outbounds": serverOutbounds,
 	}
-	writeJSON(filepath.Join(instanceDir, "config.json"), serverConfig)
+	writeJSON(filepath.Join(instanceDir, "config.json"), serverConfigMap)
 
 	// 2. Client Config Generator
 	genClient := func(serverIP, suffix string) {
@@ -400,10 +465,10 @@ func createInstance(r *bufio.Reader) {
 
 	// Run
 	setupCron(filepath.Join(instanceDir, "config.json"), filepath.Join(instanceDir, "access.log"))
-	
+
 	// Show Info
 	displayInfo(id, ipv4, ipv6, port, password, obfsPass, sni, up, down)
-	
+
 	// Extra info for new features
 	if enableMixed {
 		fmt.Printf(Colors["Cyan"]+"Mixed Proxy Enabled: %s:%d\n"+Colors["Reset"], mixedIP, mixedPort)
@@ -411,6 +476,9 @@ func createInstance(r *bufio.Reader) {
 	if enableClash {
 		fmt.Printf(Colors["Cyan"]+"Clash API Enabled:   %s:%d\n"+Colors["Reset"], clashIP, clashPort)
 		fmt.Printf(Colors["Cyan"]+"Clash Secret:        %s\n"+Colors["Reset"], clashSecret)
+	}
+	if enableWarp {
+		fmt.Printf(Colors["Cyan"] + "WARP Enabled:        Yes (WireGuard outbound)\n" + Colors["Reset"])
 	}
 	fmt.Println("\nPress Enter to return...")
 	r.ReadString('\n')
@@ -493,7 +561,7 @@ func viewConfigs(r *bufio.Reader) {
 
 	// Display New Features Info (Found in Client Config)
 	fmt.Println(Colors["Yellow"] + "--- Extra Features (from Client Config) ---" + Colors["Reset"])
-	
+
 	// Check Mixed
 	mixedFound := false
 	for _, in := range clientV4.Inbounds {
@@ -937,4 +1005,109 @@ func setupCron(configPath, logPath string) {
 	cmd.Stdin = strings.NewReader(newCron)
 	cmd.Run()
 	exec.Command("nohup", bin, "run", "-c", configPath).Start()
+}
+
+// ==========================================
+// WARP Functions
+// ==========================================
+
+func generateWarpKeys() (privKey, pubKey string, err error) {
+	curve := ecdh.X25519()
+	priv, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+	pub := priv.PublicKey()
+	privKey = base64.StdEncoding.EncodeToString(priv.Bytes())
+	pubKey = base64.StdEncoding.EncodeToString(pub.Bytes())
+	return privKey, pubKey, nil
+}
+
+func fetchWarpConfig() (WarpResponse, error) {
+	privKey, pubKey, err := generateWarpKeys()
+	if err != nil {
+		return WarpResponse{}, fmt.Errorf("key generation failed: %v", err)
+	}
+
+	tos := time.Now().Format(time.RFC3339)
+	reqPayload := cfRegisterRequest{TOS: tos, Key: pubKey}
+	jsonPayload, err := json.Marshal(reqPayload)
+	if err != nil {
+		return WarpResponse{}, fmt.Errorf("payload marshal failed: %v", err)
+	}
+
+	req, err := http.NewRequest("POST", CFWarpRegURL, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return WarpResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return WarpResponse{}, fmt.Errorf("http request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return WarpResponse{}, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var cfResp cfRegisterResponse
+	if err := json.NewDecoder(resp.Body).Decode(&cfResp); err != nil {
+		return WarpResponse{}, fmt.Errorf("failed to decode response: %v", err)
+	}
+
+	if len(cfResp.Config.Peers) == 0 {
+		return WarpResponse{}, fmt.Errorf("no peers in WARP response")
+	}
+
+	return WarpResponse{
+		ClientID: cfResp.Config.ClientID,
+		V4:       cfResp.Config.Interface.Addresses.V4,
+		V6:       cfResp.Config.Interface.Addresses.V6,
+		PubKey:   cfResp.Config.Peers[0].PublicKey,
+		PrivKey:  privKey,
+	}, nil
+}
+
+func decodeClientID(clientID string) []int {
+	decoded, err := base64.StdEncoding.DecodeString(clientID)
+	if err != nil {
+		return []int{0, 0, 0}
+	}
+	reserved := make([]int, len(decoded))
+	for i, b := range decoded {
+		reserved[i] = int(b)
+	}
+	return reserved
+}
+
+func buildWireGuardOutbound(warp WarpResponse) map[string]interface{} {
+	// Resolve WARP endpoint
+	ips, err := net.LookupIP("engage.cloudflareclient.com")
+	endpoint := "162.159.193.1" // fallback
+	if err == nil && len(ips) > 0 {
+		endpoint = ips[0].String()
+	}
+
+	reserved := decodeClientID(warp.ClientID)
+
+	return map[string]interface{}{
+		"type":          "wireguard",
+		"tag":           "warp-out",
+		"local_address": []string{warp.V4 + "/32", warp.V6 + "/128"},
+		"private_key":   warp.PrivKey,
+		"peers": []map[string]interface{}{
+			{
+				"server":      endpoint,
+				"server_port": 2408,
+				"public_key":  warp.PubKey,
+				"allowed_ips": []string{"0.0.0.0/0", "::/0"},
+				"reserved":    reserved,
+			},
+		},
+		"mtu": 1280,
+	}
 }
