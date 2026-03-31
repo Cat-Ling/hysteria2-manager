@@ -36,6 +36,7 @@ import (
 type Config struct {
 	Log          LogConfig           `json:"log"`
 	DNS          *DNSConfig          `json:"dns,omitempty"`
+	Endpoints    []Endpoint          `json:"endpoints,omitempty"`
 	Inbounds     []Inbound           `json:"inbounds,omitempty"`
 	Outbounds    []Outbound          `json:"outbounds"`
 	Route        *RouteConfig        `json:"route,omitempty"`
@@ -58,7 +59,8 @@ type DNSServer struct {
 	Tag             string `json:"tag"`
 	Type            string `json:"type,omitempty"`
 	Server          string `json:"server,omitempty"`
-	Address         string `json:"address,omitempty"`
+	ServerPort      int    `json:"server_port,omitempty"`
+	DomainResolver  string `json:"domain_resolver,omitempty"`
 	AddressResolver string `json:"address_resolver,omitempty"`
 	Detour          string `json:"detour,omitempty"`
 	Path            string `json:"path,omitempty"`
@@ -76,6 +78,7 @@ type Inbound struct {
 	ListenPort    int         `json:"listen_port,omitempty"`
 	UpMbps        int         `json:"up_mbps,omitempty"`
 	DownMbps      int         `json:"down_mbps,omitempty"`
+	BBRProfile    string      `json:"bbr_profile,omitempty"`
 	Users         []User      `json:"users,omitempty"`
 	TLS           *TLSConfig  `json:"tls,omitempty"`
 	Obfs          *ObfsConfig `json:"obfs,omitempty"`
@@ -85,19 +88,41 @@ type Inbound struct {
 	Stack         string      `json:"stack,omitempty"`
 	AutoRoute     bool        `json:"auto_route,omitempty"`
 	StrictRoute   bool        `json:"strict_route,omitempty"`
-	Sniff         bool        `json:"sniff,omitempty"`
 }
 
 type Outbound struct {
-	Type       string      `json:"type"`
-	Tag        string      `json:"tag"`
-	Server     string      `json:"server,omitempty"`
-	ServerPort int         `json:"server_port,omitempty"`
-	Password   string      `json:"password,omitempty"`
-	UpMbps     int         `json:"up_mbps,omitempty"`
-	DownMbps   int         `json:"down_mbps,omitempty"`
-	TLS        *TLSConfig  `json:"tls,omitempty"`
-	Obfs       *ObfsConfig `json:"obfs,omitempty"`
+	Type           string      `json:"type"`
+	Tag            string      `json:"tag"`
+	Detour         string      `json:"detour,omitempty"`
+	Server         string      `json:"server,omitempty"`
+	ServerPort     int         `json:"server_port,omitempty"`
+	ServerPorts    []string    `json:"server_ports,omitempty"`
+	HopInterval    string      `json:"hop_interval,omitempty"`
+	HopIntervalMax string      `json:"hop_interval_max,omitempty"`
+	BBRProfile     string      `json:"bbr_profile,omitempty"`
+	Password       string      `json:"password,omitempty"`
+	UpMbps         int         `json:"up_mbps,omitempty"`
+	DownMbps       int         `json:"down_mbps,omitempty"`
+	TLS            *TLSConfig  `json:"tls,omitempty"`
+	Obfs           *ObfsConfig `json:"obfs,omitempty"`
+}
+
+type Endpoint struct {
+	Type       string   `json:"type"`
+	Tag        string   `json:"tag"`
+	Address    []string `json:"address,omitempty"`
+	PrivateKey string   `json:"private_key,omitempty"`
+	Peers      []WGPeer `json:"peers,omitempty"`
+	MTU        int      `json:"mtu,omitempty"`
+}
+
+type WGPeer struct {
+	Address      string   `json:"address"`
+	Port         int      `json:"port"`
+	PublicKey    string   `json:"public_key"`
+	PreSharedKey string   `json:"pre_shared_key,omitempty"`
+	AllowedIPs   []string `json:"allowed_ips,omitempty"`
+	Reserved     []int    `json:"reserved,omitempty"`
 }
 
 type TLSConfig struct {
@@ -222,7 +247,9 @@ func main() {
 		fmt.Println(Colors["Green"] + "Sing-Box Hysteria2 Manager" + Colors["Reset"])
 		fmt.Println("1. Create New Instance")
 		fmt.Println("2. View Existing Configs")
-		fmt.Println("3. Exit")
+		fmt.Println("3. Migrate Configs (New Syntax)")
+		fmt.Println("4. Update WARP Configs")
+		fmt.Println("5. Exit")
 		fmt.Print("\nOption: ")
 
 		reader := bufio.NewReader(os.Stdin)
@@ -235,6 +262,14 @@ func main() {
 		case "2":
 			viewConfigs(reader)
 		case "3":
+			migrateConfigs()
+			fmt.Println("\nPress Enter to return...")
+			reader.ReadString('\n')
+		case "4":
+			updateWarpConfigs()
+			fmt.Println("\nPress Enter to return...")
+			reader.ReadString('\n')
+		case "5":
 			os.Exit(0)
 		}
 	}
@@ -288,6 +323,22 @@ func createInstance(r *bufio.Reader) {
 	// Bandwidth
 	up, _ := strconv.Atoi(prompt(r, "Upload Mbps [100]: ", "100"))
 	down, _ := strconv.Atoi(prompt(r, "Download Mbps [100]: ", "100"))
+
+	// --- FEATURE: BBR Profile ---
+	bbrProfile := prompt(r, "BBR Profile (conservative/standard/aggressive) [standard]: ", "standard")
+
+	// --- FEATURE: Port Hopping ---
+	var serverPorts []string
+	var hopInterval, hopIntervalMax string
+	enableHopping := prompt(r, "Enable Port Hopping for Client? [y/N]: ", "N") == "y"
+	if enableHopping {
+		rawPorts := prompt(r, "  Server Ports (e.g. 20000-30000): ", "")
+		if rawPorts != "" {
+			serverPorts = []string{rawPorts}
+		}
+		hopInterval = prompt(r, "  Hop Interval [30s]: ", "30s")
+		hopIntervalMax = prompt(r, "  Hop Interval Max [0]: ", "0")
+	}
 
 	// --- FEATURE: Mixed Inbound ---
 	enableMixed := prompt(r, "Enable Mixed (HTTP/SOCKS) Inbound? [y/N]: ", "N") == "y"
@@ -343,26 +394,37 @@ func createInstance(r *bufio.Reader) {
 
 	// 1. Server Config
 	// Build server outbounds
-	var serverOutbounds []interface{}
-	if enableWarp {
-		wgOutbound := buildWireGuardOutbound(warpConfig)
-		serverOutbounds = append(serverOutbounds, wgOutbound)
-	}
-	serverOutbounds = append(serverOutbounds, map[string]string{"type": "direct", "tag": "direct"})
+	var serverOutbounds []Outbound
+	var endpoints []Endpoint
+	var routeRules []RouteRule
 
-	serverConfigMap := map[string]interface{}{
-		"log": LogConfig{Level: "info", Output: filepath.Join(instanceDir, "access.log"), Timestamp: true},
-		"inbounds": []Inbound{{
+	if enableWarp {
+		wgEndpoint := buildWireGuardEndpoint(warpConfig)
+		endpoints = append(endpoints, wgEndpoint)
+		// Use routing rule to send traffic to endpoint
+		routeRules = append(routeRules, RouteRule{
+			Outbound: "warp-out-endpoint",
+		})
+	}
+	serverOutbounds = append(serverOutbounds, Outbound{Type: "direct", Tag: "direct"})
+
+	serverConfig := Config{
+		Log: LogConfig{Level: "info", Output: filepath.Join(instanceDir, "access.log"), Timestamp: true},
+		Inbounds: []Inbound{{
 			Type: "hysteria2", Tag: "hy2-" + id, Listen: "::", ListenPort: port,
-			UpMbps: up, DownMbps: down,
+			UpMbps: up, DownMbps: down, BBRProfile: bbrProfile,
 			Users:      []User{{Name: "user", Password: password}},
 			TLS:        &TLSConfig{Enabled: true, CertificatePath: certPath, KeyPath: keyPath},
 			Obfs:       &ObfsConfig{Type: "salamander", Password: obfsPass},
 			Masquerade: &MasqConfig{Type: "proxy", URL: "https://" + sni + "/", RewriteHost: true},
 		}},
-		"outbounds": serverOutbounds,
+		Endpoints: endpoints,
+		Outbounds: serverOutbounds,
+		Route: &RouteConfig{
+			Rules: routeRules,
+		},
 	}
-	writeJSON(filepath.Join(instanceDir, "config.json"), serverConfigMap)
+	writeJSON(filepath.Join(instanceDir, "config.json"), serverConfig)
 
 	// 2. Client Config Generator
 	genClient := func(serverIP, suffix string) {
@@ -376,7 +438,6 @@ func createInstance(r *bufio.Reader) {
 				Stack:         "gvisor",
 				AutoRoute:     true,
 				StrictRoute:   true,
-				Sniff:         true,
 			},
 		}
 
@@ -387,7 +448,6 @@ func createInstance(r *bufio.Reader) {
 				Tag:        "mixed-in",
 				Listen:     mixedIP,
 				ListenPort: mixedPort,
-				Sniff:      true,
 			})
 		}
 
@@ -417,20 +477,25 @@ func createInstance(r *bufio.Reader) {
 			Inbounds: inbounds,
 			Outbounds: []Outbound{
 				{
-					Type:       "hysteria2",
-					Tag:        "hysteria-out",
-					Server:     serverIP,
-					ServerPort: port,
-					Password:   password,
-					UpMbps:     up,
-					DownMbps:   down,
-					TLS:        &TLSConfig{Enabled: true, Insecure: true, ServerName: sni},
-					Obfs:       &ObfsConfig{Type: "salamander", Password: obfsPass},
+					Type:           "hysteria2",
+					Tag:            "hysteria-out",
+					Server:         serverIP,
+					ServerPort:     port,
+					ServerPorts:    serverPorts,
+					HopInterval:    hopInterval,
+					HopIntervalMax: hopIntervalMax,
+					BBRProfile:     bbrProfile,
+					Password:       password,
+					UpMbps:         up,
+					DownMbps:       down,
+					TLS:            &TLSConfig{Enabled: true, Insecure: true, ServerName: sni},
+					Obfs:           &ObfsConfig{Type: "salamander", Password: obfsPass},
 				},
 				{Type: "direct", Tag: "direct"},
 			},
 			Route: &RouteConfig{
 				Rules: []RouteRule{
+					{Action: "sniff"},
 					{ClashMode: "direct", Outbound: "direct"},
 					{ClashMode: "global", Outbound: "hysteria-out"},
 				},
@@ -880,29 +945,37 @@ func parseDNSURL(raw, tag string) DNSServer {
 	}
 
 	ds := DNSServer{Tag: tag}
+	var address string
 	if strings.HasPrefix(raw, "tls://") {
 		ds.Type = "tls"
-		ds.Server = strings.TrimPrefix(raw, "tls://")
+		address = strings.TrimPrefix(raw, "tls://")
 	} else if strings.HasPrefix(raw, "h3://") {
 		ds.Type = "h3"
 		parts := strings.Split(strings.TrimPrefix(raw, "h3://"), "/")
-		ds.Server = parts[0]
+		address = parts[0]
 		if len(parts) > 1 {
 			ds.Path = "/" + strings.Join(parts[1:], "/")
 		}
 	} else if strings.HasPrefix(raw, "https://") {
 		ds.Type = "https"
 		parts := strings.Split(strings.TrimPrefix(raw, "https://"), "/")
-		ds.Server = parts[0]
+		address = parts[0]
 		if len(parts) > 1 {
 			ds.Path = "/" + strings.Join(parts[1:], "/")
 		}
 	} else if strings.HasPrefix(raw, "udp://") {
 		ds.Type = "udp"
-		ds.Server = strings.TrimPrefix(raw, "udp://")
+		address = strings.TrimPrefix(raw, "udp://")
 	} else {
 		ds.Type = "udp"
-		ds.Server = raw
+		address = raw
+	}
+
+	if host, portStr, err := net.SplitHostPort(address); err == nil {
+		ds.Server = host
+		ds.ServerPort, _ = strconv.Atoi(portStr)
+	} else {
+		ds.Server = address
 	}
 	return ds
 }
@@ -1084,7 +1157,7 @@ func decodeClientID(clientID string) []int {
 	return reserved
 }
 
-func buildWireGuardOutbound(warp WarpResponse) map[string]interface{} {
+func buildWireGuardEndpoint(warp WarpResponse) Endpoint {
 	// Resolve WARP endpoint
 	ips, err := net.LookupIP("engage.cloudflareclient.com")
 	endpoint := "162.159.193.1" // fallback
@@ -1094,20 +1167,230 @@ func buildWireGuardOutbound(warp WarpResponse) map[string]interface{} {
 
 	reserved := decodeClientID(warp.ClientID)
 
-	return map[string]interface{}{
-		"type":          "wireguard",
-		"tag":           "warp-out",
-		"local_address": []string{warp.V4 + "/32", warp.V6 + "/128"},
-		"private_key":   warp.PrivKey,
-		"peers": []map[string]interface{}{
+	return Endpoint{
+		Type:       "wireguard",
+		Tag:        "warp-out-endpoint",
+		Address:    []string{warp.V4 + "/32", warp.V6 + "/128"},
+		PrivateKey: warp.PrivKey,
+		Peers: []WGPeer{
 			{
-				"server":      endpoint,
-				"server_port": 2408,
-				"public_key":  warp.PubKey,
-				"allowed_ips": []string{"0.0.0.0/0", "::/0"},
-				"reserved":    reserved,
+				Address:    endpoint,
+				Port:       2408,
+				PublicKey:  warp.PubKey,
+				AllowedIPs: []string{"0.0.0.0/0", "::/0"},
+				Reserved:   reserved,
 			},
 		},
-		"mtu": 1280,
+		MTU: 1280,
 	}
+}
+
+func migrateConfigs() {
+	fmt.Println(Colors["Yellow"] + "Migrating configurations to new syntax..." + Colors["Reset"])
+	dirs, _ := filepath.Glob(filepath.Join(BaseDir, "*"))
+	for _, dir := range dirs {
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			continue
+		}
+		files, _ := filepath.Glob(filepath.Join(dir, "*.json"))
+		for _, file := range files {
+			var cfg map[string]interface{}
+			if !readJSON(file, &cfg) {
+				continue
+			}
+
+			// 1. Update DNS
+			if dns, ok := cfg["dns"].(map[string]interface{}); ok {
+				if servers, ok := dns["servers"].([]interface{}); ok {
+					for i, s := range servers {
+						if server, ok := s.(map[string]interface{}); ok {
+							if addr, ok := server["address"].(string); ok {
+								if host, portStr, err := net.SplitHostPort(addr); err == nil {
+									server["server"] = host
+									server["server_port"], _ = strconv.Atoi(portStr)
+								} else {
+									server["server"] = addr
+								}
+								delete(server, "address")
+								servers[i] = server
+							}
+						}
+					}
+				}
+			}
+
+			// 2. Update Hysteria2 Inbounds/Outbounds for BBR & Routing
+			if inbounds, ok := cfg["inbounds"].([]interface{}); ok {
+				for _, ib := range inbounds {
+					if inbound, ok := ib.(map[string]interface{}); ok {
+						if inbound["type"] == "hysteria2" {
+							if _, ok := inbound["bbr_profile"]; !ok {
+								inbound["bbr_profile"] = "standard"
+							}
+						}
+						// Remove legacy sniff
+						delete(inbound, "sniff")
+						delete(inbound, "domain_strategy")
+					}
+				}
+			}
+
+			// 3. Ensure Modern Routing Rules
+			if route, ok := cfg["route"].(map[string]interface{}); ok {
+				if rules, ok := route["rules"].([]interface{}); ok {
+					hasSniff := false
+					hasHijack := false
+					for _, r := range rules {
+						if rule, ok := r.(map[string]interface{}); ok {
+							if rule["action"] == "sniff" {
+								hasSniff = true
+							}
+							if rule["action"] == "hijack-dns" {
+								hasHijack = true
+							}
+						}
+					}
+					var newRules []interface{}
+					if !hasSniff {
+						newRules = append(newRules, map[string]interface{}{"action": "sniff"})
+					}
+					if !hasHijack {
+						newRules = append(newRules, map[string]interface{}{"protocol": "dns", "action": "hijack-dns"})
+					}
+					newRules = append(newRules, rules...)
+					route["rules"] = newRules
+				}
+			}
+
+			if outbounds, ok := cfg["outbounds"].([]interface{}); ok {
+				var newOutbounds []interface{}
+				var endpoints []interface{}
+
+				for _, ob := range outbounds {
+					if outbound, ok := ob.(map[string]interface{}); ok {
+						if outbound["type"] == "hysteria2" {
+							if _, ok := outbound["bbr_profile"]; !ok {
+								outbound["bbr_profile"] = "standard"
+							}
+							// Fix server_ports string to []string
+							if sp, ok := outbound["server_ports"].(string); ok && sp != "" {
+								outbound["server_ports"] = []string{sp}
+							}
+						}
+
+						if outbound["type"] == "wireguard" {
+							// Migrate to endpoint
+							endpoint := map[string]interface{}{
+								"type": "wireguard",
+								"tag":  outbound["tag"].(string) + "-endpoint",
+							}
+							if addr, ok := outbound["local_address"]; ok {
+								endpoint["address"] = addr
+							}
+							if priv, ok := outbound["private_key"]; ok {
+								endpoint["private_key"] = priv
+							}
+							if mtu, ok := outbound["mtu"]; ok {
+								endpoint["mtu"] = mtu
+							}
+
+							if peers, ok := outbound["peers"].([]interface{}); ok {
+								for i, p := range peers {
+									if peer, ok := p.(map[string]interface{}); ok {
+										if srv, ok := peer["server"]; ok {
+											peer["address"] = srv
+											delete(peer, "server")
+										}
+										if port, ok := peer["server_port"]; ok {
+											peer["port"] = port
+											delete(peer, "server_port")
+										}
+										peers[i] = peer
+									}
+								}
+								endpoint["peers"] = peers
+							}
+
+							endpoints = append(endpoints, endpoint)
+
+							// In modern sing-box, we don't need a wrapper outbound for an endpoint.
+							// We can just use the endpoint tag in routing rules.
+							// For safety during migration, we'll ensure a routing rule exists.
+							if route, ok := cfg["route"].(map[string]interface{}); ok {
+								if rules, ok := route["rules"].([]interface{}); ok {
+									hasRule := false
+									for _, r := range rules {
+										if rule, ok := r.(map[string]interface{}); ok {
+											if rule["outbound"] == endpoint["tag"] {
+												hasRule = true
+												break
+											}
+										}
+									}
+									if !hasRule {
+										route["rules"] = append([]interface{}{map[string]interface{}{"outbound": endpoint["tag"]}}, rules...)
+									}
+								}
+							}
+						} else {
+							newOutbounds = append(newOutbounds, outbound)
+						}
+					} else {
+						newOutbounds = append(newOutbounds, ob)
+					}
+				}
+				cfg["outbounds"] = newOutbounds
+				if len(endpoints) > 0 {
+					if existingEndpoints, ok := cfg["endpoints"].([]interface{}); ok {
+						cfg["endpoints"] = append(existingEndpoints, endpoints...)
+					} else {
+						cfg["endpoints"] = endpoints
+					}
+				}
+			}
+
+			writeJSON(file, cfg)
+		}
+	}
+	fmt.Println(Colors["Green"] + "Migration completed!" + Colors["Reset"])
+}
+
+func updateWarpConfigs() {
+	fmt.Println(Colors["Yellow"] + "Updating WARP configurations..." + Colors["Reset"])
+	dirs, _ := filepath.Glob(filepath.Join(BaseDir, "*"))
+	for _, dir := range dirs {
+		configPath := filepath.Join(dir, "config.json")
+		var cfg Config
+		if !readJSON(configPath, &cfg) {
+			continue
+		}
+
+		hasWarp := false
+		for _, e := range cfg.Endpoints {
+			if e.Tag == "warp-out-endpoint" {
+				hasWarp = true
+				break
+			}
+		}
+
+		if hasWarp {
+			fmt.Printf("Updating WARP for %s...\n", filepath.Base(dir))
+			warpConfig, err := fetchWarpConfig()
+			if err != nil {
+				fmt.Printf(Colors["Red"]+"  Failed: %v\n"+Colors["Reset"], err)
+				continue
+			}
+
+			newWgEndpoint := buildWireGuardEndpoint(warpConfig)
+			for i, e := range cfg.Endpoints {
+				if e.Tag == "warp-out-endpoint" {
+					cfg.Endpoints[i] = newWgEndpoint
+					break
+				}
+			}
+			writeJSON(configPath, cfg)
+			fmt.Println(Colors["Green"] + "  Updated successfully!" + Colors["Reset"])
+		}
+	}
+	fmt.Println(Colors["Green"] + "WARP update completed!" + Colors["Reset"])
 }
